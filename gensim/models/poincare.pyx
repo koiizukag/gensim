@@ -48,6 +48,7 @@ from numbers import Integral
 import sys
 import time
 import threading
+cimport numpy as cnp
 
 import numpy as np
 from collections import defaultdict, Counter
@@ -60,6 +61,7 @@ from gensim import utils, matutils
 from gensim.models.keyedvectors import Vocab, BaseKeyedVectors
 from gensim.models.utils_any2vec import _save_word2vec_format, _load_word2vec_format
 from numpy import float32 as REAL
+
 
 try:
     from autograd import grad  # Only required for optionally verifying gradients while training
@@ -94,6 +96,7 @@ class PoincareModel(utils.SaveLoad):
         See the documentation of its class for usage examples.
 
     """
+
     def __init__(self, train_data, size=50, alpha=0.1, negative=10, workers=1, epsilon=1e-5, regularization_coeff=1.0,
                  burn_in=10, burn_in_alpha=0.01, init_range=(-0.001, 0.001), dtype=np.float64, seed=0):
         """Initialize and train a Poincare embedding model from an iterable of relations.
@@ -155,7 +158,7 @@ class PoincareModel(utils.SaveLoad):
         self.kv = PoincareKeyedVectors(size)
         self.all_relations = []
         self.node_relations = defaultdict(set)
-        self._negatives_buffer = NegativesBuffer([])
+        self._negatives_buffer = NegativesBuffer(np.array([]))
         self._negatives_buffer_size = 2000
         self.size = size
         self.train_alpha = alpha  # Learning rate for training
@@ -428,7 +431,7 @@ class PoincareModel(utils.SaveLoad):
 
         Returns
         -------
-        :class:`~gensim.models.poincare.PoincareModel`
+        :class:`~gensim.models.poincare.pyx.PoincareModel`
             The loaded model.
 
         """
@@ -450,7 +453,7 @@ class PoincareModel(utils.SaveLoad):
 
         Returns
         -------
-        :class:`~gensim.models.poincare.PoincareBatch`
+        :class:`~gensim.models.poincare.pyx.PoincareBatch`
             Node indices, computed gradients and loss for the batch.
 
         """
@@ -482,7 +485,7 @@ class PoincareModel(utils.SaveLoad):
             List of tuples of positive examples of the form (node_1_index, node_2_index).
         all_negatives : list of lists
             List of lists of negative samples for each node_1 in the positive examples.
-        batch : :class:`~gensim.models.poincare.PoincareBatch`
+        batch : :class:`~gensim.models.poincare.pyx.PoincareBatch`
             Batch for which computed gradients are to be checked.
         tol : float, optional
             The maximum error between our computed gradients and the reference ones from autograd.
@@ -539,7 +542,7 @@ class PoincareModel(utils.SaveLoad):
 
         Returns
         -------
-        :class:`~gensim.models.poincare.PoincareBatch`
+        :class:`~gensim.models.poincare.pyx.PoincareBatch`
             The batch that was just trained on, contains computed loss for the batch.
 
         """
@@ -582,7 +585,7 @@ class PoincareModel(utils.SaveLoad):
 
         Parameters
         ----------
-        batch : :class:`~gensim.models.poincare.PoincareBatch`
+        batch : :class:`~gensim.models.poincare.pyx.PoincareBatch`
             Batch containing computed gradients and node indices of the batch for which updates are to be done.
 
         """
@@ -674,14 +677,13 @@ class PoincareModel(utils.SaveLoad):
             Useful for debugging, doesn't compare by default.
 
         """
-
+        workers = []
+        worker_results = []
         for epoch in range(1, epochs + 1):
             indices = list(range(len(self.all_relations)))
             self._np_random.shuffle(indices)
             avg_loss = 0.0
             last_time = time.time()
-            workers = []
-            worker_results = []
             total_batch_num = 0
             for batch_num, i in enumerate(range(0, len(indices), batch_size), start=1):
                 check_gradients = bool(check_gradients_every) and (batch_num % check_gradients_every) == 0
@@ -696,7 +698,8 @@ class PoincareModel(utils.SaveLoad):
                     )
                 )
 
-                if len(workers) == self.workers or batch_num == len(indices) / batch_size:
+                if len(workers) == self.workers \
+                        or (epoch == epochs and batch_num - 1 == int(len(indices) / batch_size)):
                     for thread in workers:
                         thread.daemon = True  # make interrupting the process with ctrl+c easier
                         thread.start()
@@ -704,13 +707,12 @@ class PoincareModel(utils.SaveLoad):
                     for thread in workers:
                         thread.join()
 
-                    workers = []
-                    worker_results = []
-
                     for result in worker_results:
                         total_batch_num += 1
                         avg_loss += result.loss
                         should_print = not (total_batch_num % print_every)
+                        workers = []
+                        worker_results = []
                         if should_print:
                             avg_loss /= print_every
                             time_taken = time.time() - last_time
@@ -1015,7 +1017,7 @@ class PoincareKeyedVectors(BaseKeyedVectors):
 
         Returns
         -------
-        :class:`~gensim.models.poincare.PoincareModel`
+        :class:`~gensim.models.poincare.pyx.PoincareModel`
             Loaded Poincare model.
 
         """
@@ -1490,8 +1492,11 @@ class PoincareRelations(object):
                 yield tuple(row)
 
 
-class NegativesBuffer(object):
+cdef class NegativesBuffer(object):
     """Buffer and return negative samples."""
+
+    cdef cnp.ndarray _items
+    cdef int _current_index
 
     def __init__(self, items):
         """Initialize instance from list or numpy array of samples.
@@ -1502,8 +1507,8 @@ class NegativesBuffer(object):
             List or array containing negative samples.
 
         """
-        self._items = items
         self._current_index = 0
+        self._items = items
 
     def num_items(self):
         """Get the number of items remaining in the buffer.
@@ -1551,7 +1556,7 @@ class ReconstructionEvaluation(object):
         ----------
         file_path : str
             Path to tsv file containing relation pairs.
-        embedding : :class:`~gensim.models.poincare.PoincareKeyedVectors`
+        embedding : :class:`~gensim.models.poincare.pyx.PoincareKeyedVectors`
             Embedding to be evaluated.
 
         """
@@ -1657,7 +1662,7 @@ class LinkPredictionEvaluation(object):
             Path to tsv file containing relation pairs used for training.
         test_path : str
             Path to tsv file containing relation pairs to evaluate.
-        embedding : :class:`~gensim.models.poincare.PoincareKeyedVectors`
+        embedding : :class:`~gensim.models.poincare.pyx.PoincareKeyedVectors`
             Embedding to be evaluated.
 
         """
@@ -1783,7 +1788,7 @@ class LexicalEntailmentEvaluation(object):
 
         Parameters
         ----------
-        embedding : :class:`~gensim.models.poincare.PoincareKeyedVectors`
+        embedding : :class:`~gensim.models.poincare.pyx.PoincareKeyedVectors`
             Embedding to use for computing predicted score.
         trie : :class:`pygtrie.Trie`
             Trie to use for finding matching vocab terms for input terms.
@@ -1843,7 +1848,7 @@ class LexicalEntailmentEvaluation(object):
 
         Parameters
         ----------
-        embedding : :class:`~gensim.models.poincare.PoincareKeyedVectors`
+        embedding : :class:`~gensim.models.poincare.pyx.PoincareKeyedVectors`
             Embedding for which trie is to be created.
 
         Returns
@@ -1868,7 +1873,7 @@ class LexicalEntailmentEvaluation(object):
 
         Parameters
         ----------
-        embedding : :class:`~gensim.models.poincare.PoincareKeyedVectors`
+        embedding : :class:`~gensim.models.poincare.pyx.PoincareKeyedVectors`
             Embedding for which evaluation is to be done.
 
         Returns
