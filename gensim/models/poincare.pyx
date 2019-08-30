@@ -61,7 +61,10 @@ from gensim import utils, matutils
 from gensim.models.keyedvectors import Vocab, BaseKeyedVectors
 from gensim.models.utils_any2vec import _save_word2vec_format, _load_word2vec_format
 from numpy import float32 as REAL
-
+from libcpp.vector cimport vector
+from libcpp.pair cimport pair
+from libcpp.string cimport string
+from libcpp.unordered_map cimport unordered_map
 
 try:
     from autograd import grad  # Only required for optionally verifying gradients while training
@@ -73,7 +76,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class PoincareModel(utils.SaveLoad):
+cdef class PoincareModel:
     """Train, use and evaluate Poincare Embeddings.
 
     The model can be stored/loaded via its :meth:`~gensim.models.poincare.PoincareModel.save`
@@ -96,9 +99,18 @@ class PoincareModel(utils.SaveLoad):
         See the documentation of its class for usage examples.
 
     """
+    cdef vector[pair[string, string]] train_data
+    cpdef kv
+    cdef vector[pair[int, int]] all_relations
+    # cpdef unordered_map[int, int] node_relations
+    cpdef node_relations
+    cdef NegativesBuffer _negatives_buffer
+    cdef int _negatives_buffer_size, size, negative, workers, burn_in, seed
+    cdef double alpha, epsilon, regularization_coeff
+    cpdef train_alpha, burn_in_alpha, indices_set, indices_array, epsilor, _burn_in_done, dtype, _np_random, init_range, _loss_grad, _node_counts_cumsum, _node_probabilities
 
-    def __init__(self, train_data, size=50, alpha=0.1, negative=10, workers=1, epsilon=1e-5, regularization_coeff=1.0,
-                 burn_in=10, burn_in_alpha=0.01, init_range=(-0.001, 0.001), dtype=np.float64, seed=0):
+    def __init__(self, train_data, int size=50, double alpha=0.1, int negative=10, int workers=1, double epsilon=1e-5, double regularization_coeff=1.0,
+                 int burn_in=10, double burn_in_alpha=0.01, init_range=(-0.001, 0.001), dtype=np.float64, int seed=0):
         """Initialize and train a Poincare embedding model from an iterable of relations.
 
         Parameters
@@ -154,7 +166,8 @@ class PoincareModel(utils.SaveLoad):
         See :class:`~gensim.models.poincare.PoincareRelations` for more options.
 
         """
-        self.train_data = train_data
+
+        self.train_data = [(t[0].encode("UTF-8"), t[1].encode("UTF-8")) for t in train_data]
         self.kv = PoincareKeyedVectors(size)
         self.all_relations = []
         self.node_relations = defaultdict(set)
@@ -175,9 +188,9 @@ class PoincareModel(utils.SaveLoad):
         self._np_random = np_random.RandomState(seed)
         self.init_range = init_range
         self._loss_grad = None
-        self.build_vocab(train_data)
+        self.build_vocab([(t[0].encode("UTF-8"), t[1].encode("UTF-8")) for t in train_data])
 
-    def build_vocab(self, relations, update=False):
+    cdef build_vocab(self, vector[pair[string, string]] relations, update=False):
         """Build the model's vocabulary from known relations.
 
         Parameters
@@ -228,7 +241,7 @@ class PoincareModel(utils.SaveLoad):
             node_1_index, node_2_index = self.kv.vocab[node_1].index, self.kv.vocab[node_2].index
             self.node_relations[node_1_index].add(node_2_index)
             relation = (node_1_index, node_2_index)
-            self.all_relations.append(relation)
+            self.all_relations.push_back(relation)
         logger.info("loaded %d relations from train data, %d nodes", len(self.all_relations), len(self.kv.vocab))
         self.indices_set = set(range(len(self.kv.index2word)))  # Set of all node indices
         self.indices_array = np.fromiter(range(len(self.kv.index2word)), dtype=int)  # Numpy array of all node indices
@@ -239,18 +252,18 @@ class PoincareModel(utils.SaveLoad):
         else:
             self._update_embeddings(old_index2word_len)
 
-    def _init_embeddings(self):
+    cdef _init_embeddings(self):
         """Randomly initialize vectors for the items in the vocab."""
         shape = (len(self.kv.index2word), self.size)
         self.kv.syn0 = self._np_random.uniform(self.init_range[0], self.init_range[1], shape).astype(self.dtype)
 
-    def _update_embeddings(self, old_index2word_len):
+    cdef _update_embeddings(self, int old_index2word_len):
         """Randomly initialize vectors for the items in the additional vocab."""
         shape = (len(self.kv.index2word) - old_index2word_len, self.size)
         v = self._np_random.uniform(self.init_range[0], self.init_range[1], shape).astype(self.dtype)
         self.kv.syn0 = np.concatenate([self.kv.syn0, v])
 
-    def _init_node_probabilities(self):
+    cdef _init_node_probabilities(self):
         """Initialize a-priori probabilities."""
         counts = np.fromiter((
                 self.kv.vocab[self.kv.index2word[i]].count
@@ -260,7 +273,7 @@ class PoincareModel(utils.SaveLoad):
         self._node_counts_cumsum = np.cumsum(counts)
         self._node_probabilities = counts / counts.sum()
 
-    def _get_candidate_negatives(self):
+    cdef _get_candidate_negatives(self):
         """Get candidate negatives of size `self.negative` from the negative examples buffer.
 
         Returns
@@ -279,7 +292,7 @@ class PoincareModel(utils.SaveLoad):
             self._negatives_buffer = NegativesBuffer(cumsum_table_indices)
         return self._negatives_buffer.get_items(self.negative)
 
-    def _sample_negatives(self, node_index):
+    cdef _sample_negatives(self, int node_index):
         """Get a sample of negatives for the given node.
 
         Parameters
@@ -325,7 +338,7 @@ class PoincareModel(utils.SaveLoad):
         return list(indices)
 
     @staticmethod
-    def _loss_fn(matrix, regularization_coeff=1.0):
+    def _loss_fn(matrix, double regularization_coeff=1.0):
         """Computes loss value.
 
         Parameters
@@ -360,7 +373,7 @@ class PoincareModel(utils.SaveLoad):
         return -grad_np.log(exp_negative_distances[0] / (exp_negative_distances.sum())) + regularization_term
 
     @staticmethod
-    def _clip_vectors(vectors, epsilon):
+    def _clip_vectors(vectors, double epsilon):
         """Clip vectors to have a norm of less than one.
 
         Parameters
@@ -439,7 +452,7 @@ class PoincareModel(utils.SaveLoad):
         model._init_node_probabilities()
         return model
 
-    def _prepare_training_batch(self, relations, all_negatives, check_gradients=False):
+    cdef _prepare_training_batch(self, vector[pair[int, int]] relations, vector[vector[int]] all_negatives, check_gradients=False):
         """Create a training batch and compute gradients and loss for the batch.
 
         Parameters
@@ -476,7 +489,7 @@ class PoincareModel(utils.SaveLoad):
 
         return batch
 
-    def _check_gradients(self, relations, all_negatives, batch, tol=1e-8):
+    cdef _check_gradients(self, vector[pair[int, int]] relations, vector[vector[int]] all_negatives, batch, tol=1e-8):
         """Compare computed gradients for batch to autograd gradients.
 
         Parameters
@@ -513,12 +526,12 @@ class PoincareModel(utils.SaveLoad):
             'Max difference between computed gradients and autograd gradients %.10f, '
             'greater than tolerance %.10f' % (max_diff, tol))
 
-    def _sample_negatives_batch(self, nodes):
+    cdef vector[vector[int]] _sample_negatives_batch(self, vector[int] nodes):
         """Get negative examples for each node.
 
         Parameters
         ----------
-        nodes : iterable of int
+        nodes : iterable of intqq
             Iterable of node indices for which negative samples are to be returned.
 
         Returns
@@ -530,7 +543,7 @@ class PoincareModel(utils.SaveLoad):
         all_indices = [self._sample_negatives(node) for node in nodes]
         return all_indices
 
-    def _train_on_batch(self, relations, worker_results, check_gradients=False):
+    def _train_on_batch(self, vector[pair[int, int]] relations, worker_results, check_gradients=False):
         """Perform training for a single training batch.
 
         Parameters
@@ -546,7 +559,7 @@ class PoincareModel(utils.SaveLoad):
             The batch that was just trained on, contains computed loss for the batch.
 
         """
-        all_negatives = self._sample_negatives_batch(relation[0] for relation in relations)
+        all_negatives = self._sample_negatives_batch(relation.first for relation in relations)
         batch = self._prepare_training_batch(relations, all_negatives, check_gradients)
         self._update_vectors_batch(batch)
         worker_results.append(batch)
@@ -580,7 +593,7 @@ class PoincareModel(utils.SaveLoad):
             vector_updates[positions[-1]] = vector_updates[positions].sum(axis=0)
             vector_updates[positions[:-1]] = 0
 
-    def _update_vectors_batch(self, batch):
+    cdef _update_vectors_batch(self, batch):
         """Update vectors for nodes in the given batch.
 
         Parameters
@@ -607,7 +620,7 @@ class PoincareModel(utils.SaveLoad):
         self.kv.syn0[indices_v] -= v_updates
         self.kv.syn0[indices_v] = self._clip_vectors(self.kv.syn0[indices_v], self.epsilon)
 
-    def train(self, epochs, batch_size=10, print_every=1000, check_gradients_every=None):
+    def train(self, int epochs, int batch_size=10, int print_every=1000, check_gradients_every=None):
         """Train Poincare embeddings using loaded data and model parameters.
 
         Parameters
@@ -661,7 +674,7 @@ class PoincareModel(utils.SaveLoad):
 
         np.seterr(**old_settings)
 
-    def _train_batchwise(self, epochs, batch_size=10, print_every=1000, check_gradients_every=None):
+    cdef _train_batchwise(self, int epochs, int batch_size=10, int print_every=1000, check_gradients_every=None):
         """Train Poincare embeddings using specified parameters.
 
         Parameters
@@ -727,12 +740,15 @@ class PoincareModel(utils.SaveLoad):
                             avg_loss = 0.0
 
 
-class PoincareBatch(object):
+cdef class PoincareBatch:
     """Compute Poincare distances, gradients and loss for a training batch.
 
     Store intermediate state to avoid recomputing multiple times.
 
     """
+    cpdef public vectors_u, vectors_v, indices_u, indices_v, regularization_coeff, poincare_dists, euclidean_dists, norms_u, norms_v, alpha, beta, gamma, gradients_u, distance_gradients_u
+    cpdef public gradients_v, distance_gradients_v, loss, _distances_computed, _gradients_computed, _distance_gradients_computed, _loss_computed, exp_negative_distances, Z
+
     def __init__(self, vectors_u, vectors_v, indices_u, indices_v, regularization_coeff=1.0):
         """
         Initialize instance with sets of vectors for which distances are to be computed.
@@ -780,14 +796,14 @@ class PoincareBatch(object):
         self._distance_gradients_computed = False
         self._loss_computed = False
 
-    def compute_all(self):
+    cdef compute_all(self):
         """Convenience method to perform all computations."""
         self.compute_distances()
         self.compute_distance_gradients()
         self.compute_gradients()
         self.compute_loss()
 
-    def compute_distances(self):
+    cdef compute_distances(self):
         """Compute and store norms, euclidean distances and poincare distances between input vectors."""
         if self._distances_computed:
             return
@@ -816,7 +832,7 @@ class PoincareBatch(object):
 
         self._distances_computed = True
 
-    def compute_gradients(self):
+    cdef compute_gradients(self):
         """Compute and store gradients of loss function for all input vectors."""
         if self._gradients_computed:
             return
@@ -842,7 +858,7 @@ class PoincareBatch(object):
 
         self._gradients_computed = True
 
-    def compute_distance_gradients(self):
+    cdef compute_distance_gradients(self):
         """Compute and store partial derivatives of poincare distance d(u, v) w.r.t all u and all v."""
         if self._distance_gradients_computed:
             return
@@ -872,7 +888,7 @@ class PoincareBatch(object):
 
         self._distance_gradients_computed = True
 
-    def compute_loss(self):
+    cdef compute_loss(self):
         """Compute and store loss value for the given batch of examples."""
         if self._loss_computed:
             return
@@ -1498,7 +1514,7 @@ cdef class NegativesBuffer(object):
     cdef cnp.ndarray _items
     cdef int _current_index
 
-    def __init__(self, items):
+    def __init__(self, cnp.ndarray items):
         """Initialize instance from list or numpy array of samples.
 
         Parameters
@@ -1521,7 +1537,7 @@ cdef class NegativesBuffer(object):
         """
         return len(self._items) - self._current_index
 
-    def get_items(self, num_items):
+    def get_items(self, int num_items):
         """Get the next `num_items` from buffer.
 
         Parameters
