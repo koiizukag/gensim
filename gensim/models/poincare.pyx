@@ -48,7 +48,7 @@ from numbers import Integral
 import sys
 import time
 import threading
-cimport numpy as cnp
+cimport numpy as np
 
 import numpy as np
 from collections import defaultdict, Counter
@@ -171,7 +171,7 @@ cdef class PoincareModel:
         self.kv = PoincareKeyedVectors(size)
         self.all_relations = []
         self.node_relations = defaultdict(set)
-        self._negatives_buffer = NegativesBuffer(np.array([]))
+        self._negatives_buffer = NegativesBuffer(np.array([], dtype=int))
         self._negatives_buffer_size = 2000
         self.size = size
         self.train_alpha = alpha  # Learning rate for training
@@ -315,6 +315,7 @@ cdef class PoincareModel:
             )
 
         positive_fraction = float(len(node_relations)) / len(self.kv.vocab)
+        cdef long[:] valid_negatives
         if positive_fraction < 0.01:
             # If number of positive relations is a small fraction of total nodes
             # re-sample till no positively connected nodes are chosen
@@ -333,7 +334,8 @@ cdef class PoincareModel:
             valid_negatives = np.array(list(self.indices_set - node_relations))
             probs = self._node_probabilities[valid_negatives]
             probs /= probs.sum()
-            indices = self._np_random.choice(valid_negatives, size=self.negative, p=probs, replace=False)
+            indices = [np.searchsorted(probs.cumsum(), np_random.random()) for i in range(self.negative)]
+            # indices = self._np_random.choice(valid_negatives, size=self.negative, p=probs, replace=False)
 
         return list(indices)
 
@@ -471,10 +473,16 @@ cdef class PoincareModel:
 
         """
         batch_size = len(relations)
-        indices_u, indices_v = [], []
-        for relation, negatives in zip(relations, all_negatives):
+        cdef vector[int] indices_u
+        cdef pair[int, int] relation
+        cdef vector[int] negatives
+        cdef int u,v
+        indices_v = []
+        for i in range(len(relations)):
+            relation = relations[i]
+            negatives = all_negatives[i]
             u, v = relation
-            indices_u.append(u)
+            indices_u.push_back(u)
             indices_v.append(v)
             indices_v.extend(negatives)
 
@@ -566,7 +574,7 @@ cdef class PoincareModel:
         return batch
 
     @staticmethod
-    def _handle_duplicates(vector_updates, node_indices):
+    def _handle_duplicates(vector_updates, vector[int] node_indices):
         """Handle occurrences of multiple updates to the same node in a batch of vector updates.
 
         Parameters
@@ -585,10 +593,13 @@ cdef class PoincareModel:
 
         """
         counts = Counter(node_indices)
+        d = defaultdict(list)
+        positions = [d[index].append(i) for i, index in enumerate(node_indices)]
+        cdef int node_index, count, i
         for node_index, count in counts.items():
             if count == 1:
                 continue
-            positions = [i for i, index in enumerate(node_indices) if index == node_index]
+            positions = d[node_index]
             # Move all updates to the same node to the last such update, zeroing all the others
             vector_updates[positions[-1]] = vector_updates[positions].sum(axis=0)
             vector_updates[positions[:-1]] = 0
@@ -1511,10 +1522,10 @@ class PoincareRelations(object):
 cdef class NegativesBuffer(object):
     """Buffer and return negative samples."""
 
-    cdef cnp.ndarray _items
+    cdef long[:] _items
     cdef int _current_index
 
-    def __init__(self, cnp.ndarray items):
+    def __init__(self, long[:] items):
         """Initialize instance from list or numpy array of samples.
 
         Parameters
